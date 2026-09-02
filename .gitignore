@@ -1,0 +1,5 @@
+out/
+*.log
+.claude/
+latest
+.DS_Store
