@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -18,21 +19,34 @@ func main() {
 	}
 }
 
-// run recompresses the gzip stream at inPath into outPath at the best
-// available deflate compression level, without altering the underlying tar
-// bytes it wraps.
+// run recompresses the gzip stream at inPath into outPath. It decompresses
+// the input once, re-encodes the tar bytes with gzip at the best available
+// deflate level, and writes whichever of the two (fresh encoding vs. the
+// original bytes) is smaller — Go's flate is weaker than the zlib-class
+// compressors that produced most real .tar.gz files, so a blind
+// re-encode sometimes inflates them.
 func run(inPath, outPath string) error {
-	in, err := os.Open(inPath)
+	inBytes, err := os.ReadFile(inPath)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
 
-	gr, err := gzip.NewReader(in)
+	tarBytes, err := gunzipAll(inBytes)
 	if err != nil {
 		return err
 	}
-	defer gr.Close()
+
+	var buf bytes.Buffer
+	gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return err
+	}
+	if _, err := gw.Write(tarBytes); err != nil {
+		return err
+	}
+	if err := gw.Close(); err != nil {
+		return err
+	}
 
 	out, err := os.Create(outPath)
 	if err != nil {
@@ -40,12 +54,21 @@ func run(inPath, outPath string) error {
 	}
 	defer out.Close()
 
-	gw, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	var best []byte
+	if buf.Len() < len(inBytes) {
+		best = buf.Bytes()
+	} else {
+		best = inBytes
+	}
+	_, err = out.Write(best)
+	return err
+}
+
+func gunzipAll(data []byte) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := io.Copy(gw, gr); err != nil {
-		return err
-	}
-	return gw.Close()
+	defer gr.Close()
+	return io.ReadAll(gr)
 }
