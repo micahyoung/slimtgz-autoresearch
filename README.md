@@ -1,7 +1,6 @@
 # slimtgz-autoresearch
 
-A self-improvement loop, modeled on [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
-and on this organization's [screencam-autoresearch](../screencam-autoresearch),
+A self-improvement loop, modeled on [karpathy/autoresearch](https://github.com/karpathy/autoresearch),
 for tuning a CLI that recompresses a `.tar.gz` file into a smaller-or-equal
 copy that re-extracts to exactly the same content.
 
