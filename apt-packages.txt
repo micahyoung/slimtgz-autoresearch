@@ -1,0 +1,4 @@
+golang
+zopfli
+libdeflate-dev
+libzopfli-dev
