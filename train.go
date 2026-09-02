@@ -42,15 +42,19 @@ func main() {
 //     which already finds nearly all of the gain a zopfli run offers, then
 //     again at its full 15 iterations if the first pass finished with ample
 //     time left
+//   - a per-tar-entry decomposition: each entry re-encoded into its own
+//     gzip member with the smallest of the encoders above, so encoders can
+//     be mixed entry-by-entry where a single whole-stream encoding has to
+//     pick just one
 //
-// The last-named candidate only runs on inputs that compress well enough in
+// The libzopfli candidates only run on inputs that compress well enough in
 // Go's flate that the compute budget is governed by the fixed floor rather
 // than by a measured time (see floorDuration). For those inputs the budget
 // is a known constant, so zopfli can be given a self-imposed deadline below
 // it and never risks blowing the budget: a libzopfli call cannot be
-// interrupted, so past the deadline tryZopfli abandons the goroutine it is
-// running and returns nothing, and the encoder simply falls back to the
-// other candidates.
+// interrupted, so past the deadline the zopfli helpers abandon the goroutine
+// they are running on and return nothing, and the encoder simply falls back
+// to the other candidates.
 //
 // The original-input candidate is the reason this tool is always at worst a
 // no-op rewrite: Go's flate is weaker than the zlib-class compressors that
@@ -81,7 +85,19 @@ func run(inPath, outPath string) error {
 	}
 
 	if goBestDur < floorDuration {
-		if enc := tryZopfli(start, tarBytes); len(enc) != 0 && len(enc) < len(best) {
+		// The whole-stream zopfli pass and the per-entry zopfli pass cost
+		// about the same (both compress the full stream once), and the
+		// budget only affords one of them. Run the one whose pre-zopfli
+		// encoding is already smaller: per-entry splitting wins whenever
+		// entries want different encoders, and loses whenever entries
+		// share compressible structure across their boundaries.
+		asm, spans := assemblePerEntry(tarBytes)
+		if asm != nil && len(asm) < len(best) {
+			asm = zopfliEntries(start, spans)
+			if len(asm) > 0 && len(asm) < len(best) {
+				best = asm
+			}
+		} else if enc := tryZopfli(start, tarBytes); len(enc) != 0 && len(enc) < len(best) {
 			best = enc
 		}
 	}
@@ -121,18 +137,209 @@ func libdeflateGzip(data []byte, level int) ([]byte, bool) {
 
 func gzipBestTimed(data []byte) ([]byte, time.Duration) {
 	start := time.Now()
+	enc := gzipBest(data)
+	return enc, time.Since(start)
+}
+
+// gzipBest encodes data with Go's compress/flate at BestCompression as a
+// complete gzip member.
+func gzipBest(data []byte) []byte {
 	var buf bytes.Buffer
 	gw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
 	if err != nil {
-		return nil, time.Since(start)
+		return nil
 	}
 	if _, err := gw.Write(data); err != nil {
-		return nil, time.Since(start)
+		return nil
 	}
 	if err := gw.Close(); err != nil {
-		return nil, time.Since(start)
+		return nil
 	}
-	return buf.Bytes(), time.Since(start)
+	return buf.Bytes()
+}
+
+// entrySpan is one tar entry's byte range in the decompressed stream (the
+// 512-byte header, its data, and the padding after it) plus the encodings
+// computed over that span. best starts as the smaller of the libdeflate and
+// Go-flate members and may be replaced by a libzopfli member.
+type entrySpan struct {
+	data  []byte
+	ld    []byte
+	gom   []byte
+	best  []byte
+	ldWon bool
+}
+
+// assemblePerEntry partitions the decompressed tar into per-entry spans and
+// encodes each span into its own gzip member with the smallest of the
+// libdeflate-12 and Go-flate candidates. The concatenation of members
+// gunzips back to exactly the input tar, so the result is a valid multi-
+// member gzip archive. Returns nil (with no spans) if the tar cannot be
+// walked safely — the caller then simply has no per-entry candidate.
+func assemblePerEntry(tar []byte) ([]byte, []entrySpan) {
+	spans := tarSpans(tar)
+	if len(spans) == 0 {
+		return nil, nil
+	}
+	var out []byte
+	entries := make([]entrySpan, 0, len(spans))
+	for _, data := range spans {
+		e := entrySpan{data: data}
+		if ld, ok := libdeflateGzip(data, 12); ok {
+			e.ld = ld
+		}
+		e.gom = gzipBest(data)
+		switch {
+		case e.ld != nil && (e.gom == nil || len(e.ld) < len(e.gom)):
+			e.best = e.ld
+			e.ldWon = true
+		case e.gom != nil:
+			e.best = e.gom
+		case e.ld != nil:
+			e.best = e.ld
+		default:
+			return nil, nil
+		}
+		entries = append(entries, e)
+		out = append(out, e.best...)
+	}
+	// The assembly is built from hand-chosen encoders, so check that it
+	// really gunzips back to the input before offering it.
+	if !gunzipEquals(out, tar) {
+		return nil, nil
+	}
+	return out, entries
+}
+
+// zopfliEntries adds a libzopfli candidate on entries where libdeflate
+// already beat Go's flate — the signal that the content rewards better
+// parsers. An entry keeps its zopfli member only if it comes out smaller
+// than the per-entry best. Passes run sequentially under the same
+// self-imposed deadline as tryZopfli: a pass that has not finished by the
+// deadline is abandoned along with the rest of the per-entry zopfli work,
+// leaving those entries with their earlier encodings.
+func zopfliEntries(start time.Time, entries []entrySpan) []byte {
+	deadline := start.Add(budgetMultiple*floorDuration - zopfliKillMargin)
+
+	var out []byte
+	for i := range entries {
+		e := &entries[i]
+		if !e.ldWon || !time.Now().Before(deadline) {
+			out = append(out, e.best...)
+			continue
+		}
+		if enc := zopfliOnce(deadline, e.data); len(enc) > 0 && len(enc) < len(e.best) {
+			e.best = enc
+		}
+		out = append(out, e.best...)
+	}
+	return out
+}
+
+// zopfliOnce compresses data with libzopfli at one iteration, abandoning the
+// call at the deadline if it is still running then. Returns nil if no result
+// arrived in time.
+func zopfliOnce(deadline time.Time, data []byte) []byte {
+	results := make(chan []byte, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if enc, ok := zopfliGzip(data, 1); ok {
+			results <- enc
+		}
+	}()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case enc := <-results:
+			return enc
+		case <-done:
+			return nil
+		case <-timer.C:
+			return nil
+		}
+	}
+}
+
+// gunzipEquals reports whether gunzipping enc yields exactly want.
+func gunzipEquals(enc, want []byte) bool {
+	gr, err := gzip.NewReader(bytes.NewReader(enc))
+	if err != nil {
+		return false
+	}
+	got, err := io.ReadAll(gr)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(got, want)
+}
+
+// tarSpans partitions a tar stream into one byte span per entry: the header
+// block plus its data and trailing padding, with everything from the
+// end-of-archive marker onward merged into the last span so the spans
+// concatenate back to the full stream. Entry sizes are taken at face value
+// from the ustar size field (base-256 included); anything that would run
+// off the end of the stream aborts the walk. Returns an empty slice for an
+// empty or unparseable stream.
+func tarSpans(tar []byte) [][]byte {
+	var spans [][]byte
+	var lastStart int
+	off := 0
+	for off+512 <= len(tar) {
+		start := off
+		hdr := tar[off : off+512]
+		if hdr[0] == 0 {
+			break
+		}
+		size, ok := tarSize(hdr[124 : 124+12])
+		if !ok {
+			return nil
+		}
+		dataEnd := start + 512 + int(size)
+		if dataEnd > len(tar) {
+			return nil
+		}
+		off = dataEnd + (512-dataEnd%512)%512
+		if off > len(tar) {
+			return nil
+		}
+		lastStart = start
+		spans = append(spans, tar[start:off])
+	}
+	if len(spans) > 0 {
+		// Merge the end-of-archive zero blocks and any final padding into
+		// the last entry's span so the spans tile the whole stream.
+		spans[len(spans)-1] = tar[lastStart:len(tar)]
+	}
+	return spans
+}
+
+// tarSize reads a tar header's size field: standard octal, or GNU base-256
+// when the high bit of the first byte is set. ok is false for a field
+// without a usable value.
+func tarSize(b []byte) (int64, bool) {
+	if b[0]&0x80 != 0 {
+		v := int64(b[0] & 0x7f)
+		for _, c := range b[1:] {
+			v = v<<8 | int64(c)
+		}
+		return v, true
+	}
+	var v int64
+	sawDigit := false
+	for _, c := range b {
+		if c == 0 || c == ' ' {
+			break
+		}
+		if c < '0' || c > '7' {
+			return 0, false
+		}
+		v = v*8 + int64(c-'0')
+		sawDigit = true
+	}
+	return v, sawDigit
 }
 
 // floorDuration mirrors the fixed lower bound the compute budget is measured
