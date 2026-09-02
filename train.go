@@ -1,8 +1,9 @@
 package main
 
 /*
-#cgo LDFLAGS: -ldeflate
+#cgo LDFLAGS: -ldeflate -lzopfli
 #include <libdeflate.h>
+#include <zopfli/zopfli.h>
 #include <stdlib.h>
 */
 import "C"
@@ -10,11 +11,9 @@ import "C"
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"time"
 	"unsafe"
 )
@@ -39,16 +38,19 @@ func main() {
 //     for multi-megabyte payloads
 //   - Go's compress/flate at BestCompression
 //   - the original input bytes themselves
-//   - when the external zopfli binary is available and there is provably
-//     enough time for a full pass: zopfli at 1 iteration, then again at 15
-//     iterations if the first pass finished with time to spare
+//   - libzopfli (the engine the zopfli CLI is built on): at 1 iteration,
+//     which already finds nearly all of the gain a zopfli run offers, then
+//     again at its full 15 iterations if the first pass finished with ample
+//     time left
 //
 // The last-named candidate only runs on inputs that compress well enough in
-// Go's flate that the time budget is governed by the fixed floor rather than
-// by a measured time (see flooredBudget). For those inputs the budget is a
-// known constant, so zopfli can be given a hard self-imposed kill deadline
-// below it and never risks blowing the budget: a zopfli pass that overruns
-// is killed and the encoder simply falls back to the other candidates.
+// Go's flate that the compute budget is governed by the fixed floor rather
+// than by a measured time (see floorDuration). For those inputs the budget
+// is a known constant, so zopfli can be given a self-imposed deadline below
+// it and never risks blowing the budget: a libzopfli call cannot be
+// interrupted, so past the deadline tryZopfli abandons the goroutine it is
+// running and returns nothing, and the encoder simply falls back to the
+// other candidates.
 //
 // The original-input candidate is the reason this tool is always at worst a
 // no-op rewrite: Go's flate is weaker than the zlib-class compressors that
@@ -78,8 +80,7 @@ func run(inPath, outPath string) error {
 		best = goBest
 	}
 
-	_, lookErr := exec.LookPath("zopfli")
-	if goBestDur < floorDuration && lookErr == nil {
+	if goBestDur < floorDuration {
 		if enc := tryZopfli(start, tarBytes); len(enc) != 0 && len(enc) < len(best) {
 			best = enc
 		}
@@ -144,63 +145,101 @@ const floorDuration = 200 * time.Millisecond
 // compute budget spans.
 const budgetMultiple = 100
 
-// zopfliKillMargin is how far before that budget's expiry zopfli passes are
-// killed, so the fallback candidates can still be written out.
+// zopfliKillMargin is how far before that budget's expiry tryZopfli gives
+// up waiting, so the fallback candidates can still be written out.
 const zopfliKillMargin = 500 * time.Millisecond
 
-// tryZopfli runs the external zopfli compressor over data, under a deadline
-// derived from the (constant, floored) compute budget, measured from the
-// process start passed in. It first runs a single-iteration pass, which
-// already finds nearly all of the gain a zopfli run can offer; it only
-// follows up with a full fifteen-iteration pass when that first pass came
-// back with the whole budget's slack to spare. Returns nil when zopfli is
-// unavailable, fails, or hits the deadline.
+// tryZopfli compresses data with libzopfli under a deadline derived from
+// the (constant, floored) compute budget, measured from the process start
+// passed in. It first runs a single-iteration pass, which already finds
+// nearly all of the gain a zopfli run can offer; it only follows up with a
+// full fifteen-iteration pass when that first pass came back fast enough
+// that fifteen passes are still extrapolated to fit inside the deadline.
+// Each completed pass is reported as it finishes, and tryZopfli returns the
+// best result seen when the goroutine ends or the deadline hits, whichever
+// comes first — a pass abandoned at the deadline never discards an earlier
+// one that already finished.
+//
+// The passes run on a separate goroutine rather than inline: a
+// ZopfliCompress call cannot be interrupted, but main writing its fallback
+// and exiting the process stops the abandoned goroutine's work anyway.
+// Returns nil if no pass finished.
 func tryZopfli(start time.Time, data []byte) []byte {
 	budget := budgetMultiple * floorDuration
-	ctx, cancel := context.WithDeadline(context.Background(), start.Add(budget-zopfliKillMargin))
-	defer cancel()
+	deadline := start.Add(budget - zopfliKillMargin)
 
-	tmp, err := os.CreateTemp("", "slimtargz-")
-	if err != nil {
-		return nil
-	}
-	defer os.Remove(tmp.Name())
+	results := make(chan []byte, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		firstStart := time.Now()
+		first, ok := zopfliGzip(data, 1)
+		if !ok {
+			return
+		}
+		results <- first
+		// Fifteen iterations cost over fifteen times a single pass only
+		// when per-iteration work dominates the fixed block-splitting and
+		// LZ77 cost — on small inputs the fixed cost makes the full run far
+		// cheaper in relative terms (measured: ~3.5x on small files, ~8x on
+		// a large one). Ten is a conservative upper bound for both regimes.
+		if time.Since(firstStart)*10 >= time.Until(deadline) {
+			return
+		}
+		if second, ok := zopfliGzip(data, 15); ok && len(second) < len(first) {
+			results <- second
+		}
+	}()
 
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return nil
+	var best []byte
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case enc := <-results:
+			if len(best) == 0 || len(enc) < len(best) {
+				best = enc
+			}
+		case <-done:
+			for {
+				select {
+				case enc := <-results:
+					if len(best) == 0 || len(enc) < len(best) {
+						best = enc
+					}
+				default:
+					return best
+				}
+			}
+		case <-timer.C:
+			return best
+		}
 	}
-	if err := tmp.Close(); err != nil {
-		return nil
-	}
-
-	first, ok := zopfliPass(ctx, "--i1", tmp.Name())
-	if !ok {
-		return nil
-	}
-	if time.Since(start) > budget/4 {
-		return first
-	}
-	if second, ok := zopfliPass(ctx, "--i15", tmp.Name()); ok && len(second) < len(first) {
-		return second
-	}
-	return first
 }
 
-// zopfliPass runs one zopfli compression pass with the given iteration flag
-// over the file at path, returning its gzip output.
-func zopfliPass(ctx context.Context, iterFlag, path string) ([]byte, bool) {
-	cmd := exec.CommandContext(ctx, "zopfli", iterFlag, "-c", path)
-	var out, errBuf bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
+// zopfliGzip compresses data into a fresh gzip stream using libzopfli with
+// the given number of iterations (the same knob the zopfli CLI's --iN flag
+// sets). Returns ok=false on allocation failure.
+func zopfliGzip(data []byte, iterations int) ([]byte, bool) {
+	if len(data) == 0 {
 		return nil, false
 	}
-	if out.Len() == 0 {
+	var opts C.struct_ZopfliOptions
+	C.ZopfliInitOptions(&opts)
+	opts.numiterations = C.int(iterations)
+	opts.blocksplitting = 1
+	opts.blocksplittingmax = 15
+
+	var cOut *C.uchar
+	var cOutSize C.size_t
+	C.ZopfliCompress(&opts, C.ZOPFLI_FORMAT_GZIP,
+		(*C.uchar)(unsafe.Pointer(unsafe.SliceData(data))), C.size_t(len(data)),
+		&cOut, &cOutSize)
+	if cOut == nil {
 		return nil, false
 	}
-	return out.Bytes(), true
+	defer C.free(unsafe.Pointer(cOut))
+	return C.GoBytes(unsafe.Pointer(cOut), C.int(cOutSize)), true
 }
 
 func gunzipAll(data []byte) ([]byte, error) {
