@@ -41,10 +41,10 @@ func main() {
 //     for multi-megabyte payloads
 //   - Go's compress/flate at BestCompression
 //   - the original input bytes themselves
-//   - libzopfli (the engine the zopfli CLI is built on) at one iteration,
-//     which already finds nearly all of the gain a zopfli run offers —
-//     either over the whole stream or per tar entry, whichever side the
-//     pre-zopfli sizes favor
+//   - libzopfli (the engine the zopfli CLI is built on) — either over the
+//     whole stream or per tar entry, whichever side the pre-zopfli sizes
+//     favor; the whole-stream side starts at one iteration and refines to
+//     fifteen when the first pass left the budget's deadline far away
 //   - a per-tar-entry decomposition: each entry re-encoded into its own
 //     gzip member with the smallest of the encoders above, so encoders can
 //     be mixed entry-by-entry where a single whole-stream encoding has to
@@ -440,10 +440,10 @@ const zopfliKillMargin = 500 * time.Millisecond
 
 // tryZopfli compresses data with libzopfli under a deadline derived from
 // the (constant, floored) compute budget, measured from the process start
-// passed in. A single-iteration pass already finds nearly all of the gain a
-// zopfli run offers, and the deeper multi-iteration passes only ever paid
-// off on files that sit far below the worst-of-7 aggregate — pure compute
-// for no measurable score — so only the single pass runs.
+// passed in. It runs a single-iteration pass first and, when that finished
+// with the deadline still far away, refines with a full 15-iteration pass —
+// on the small inputs this path admits, 15 iterations beat 1 often enough
+// to be the difference between beating and losing to the other encoders.
 //
 // The pass runs on a separate goroutine rather than inline: a
 // ZopfliCompress call cannot be interrupted, but main writing its fallback
@@ -453,22 +453,52 @@ func tryZopfli(start time.Time, data []byte) []byte {
 	budget := budgetMultiple * floorDuration
 	deadline := start.Add(budget - zopfliKillMargin)
 
-	results := make(chan []byte, 1)
+	results := make(chan []byte, 2)
+	done := make(chan struct{})
 	go func() {
-		if enc, ok := zopfliGzip(data, 1); ok {
-			results <- enc
-		} else {
-			results <- nil
+		defer close(done)
+		firstStart := time.Now()
+		first, ok := zopfliGzip(data, 1)
+		if !ok {
+			return
+		}
+		results <- first
+		// Fifteen iterations cost over fifteen times a single pass only
+		// when per-iteration work dominates the fixed block-splitting and
+		// LZ77 cost — on small inputs the fixed cost makes the full run far
+		// cheaper in relative terms (measured: ~3.5x on small files, ~8x on
+		// a large one). Ten is a conservative upper bound for both regimes.
+		if time.Since(firstStart)*10 >= time.Until(deadline) {
+			return
+		}
+		if second, ok := zopfliGzip(data, 15); ok && len(second) < len(first) {
+			results <- second
 		}
 	}()
 
+	var best []byte
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	select {
-	case enc := <-results:
-		return enc
-	case <-timer.C:
-		return nil
+	for {
+		select {
+		case enc := <-results:
+			if len(best) == 0 || len(enc) < len(best) {
+				best = enc
+			}
+		case <-done:
+			for {
+				select {
+				case enc := <-results:
+					if len(best) == 0 || len(enc) < len(best) {
+						best = enc
+					}
+				default:
+					return best
+				}
+			}
+		case <-timer.C:
+			return best
+		}
 	}
 }
 
