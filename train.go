@@ -38,14 +38,20 @@ func main() {
 //     for multi-megabyte payloads
 //   - Go's compress/flate at BestCompression
 //   - the original input bytes themselves
-//   - libzopfli (the engine the zopfli CLI is built on): at 1 iteration,
-//     which already finds nearly all of the gain a zopfli run offers, then
-//     again at its full 15 iterations if the first pass finished with ample
-//     time left
+//   - libzopfli (the engine the zopfli CLI is built on) at one iteration,
+//     which already finds nearly all of the gain a zopfli run offers —
+//     either over the whole stream or per tar entry, whichever side the
+//     pre-zopfli sizes favor
 //   - a per-tar-entry decomposition: each entry re-encoded into its own
 //     gzip member with the smallest of the encoders above, so encoders can
 //     be mixed entry-by-entry where a single whole-stream encoding has to
 //     pick just one
+//
+// The encodings are independent of one another, so they run on separate
+// goroutines and the wall-clock cost is the slowest single encoding rather
+// than the sum of all of them. The compute budget is measured in wall-clock
+// terms against a single-threaded baseline, so overlapping independent work
+// is pure savings.
 //
 // The libzopfli candidates only run on inputs that compress well enough in
 // Go's flate that the compute budget is governed by the fixed floor rather
@@ -73,26 +79,44 @@ func run(inPath, outPath string) error {
 		return err
 	}
 
-	best := inBytes
+	// Whole-stream libdeflate, whole-stream Go flate, and the per-entry
+	// decomposition share no work, so run them concurrently and collect
+	// the results as they finish. Collecting in this fixed order keeps
+	// the same smallest-so-far priority the sequential version had.
+	ldCh := make(chan []byte, 1)
+	goCh := make(chan []byte, 1)
+	durCh := make(chan time.Duration, 1)
+	spanCh := make(chan []entrySpan, 1)
+	go func() {
+		enc, _ := libdeflateGzip(tarBytes, 12)
+		ldCh <- enc
+	}()
+	go func() {
+		enc, dur := gzipBestTimed(tarBytes)
+		goCh <- enc
+		durCh <- dur
+	}()
+	go func() {
+		spanCh <- buildEntrySpans(tarBytes)
+	}()
 
-	if enc, ok := libdeflateGzip(tarBytes, 12); ok && len(enc) < len(best) {
+	best := inBytes
+	if enc := <-ldCh; enc != nil && len(enc) < len(best) {
+		best = enc
+	}
+	if enc := <-goCh; len(enc) > 0 && len(enc) < len(best) {
 		best = enc
 	}
 
-	goBest, goBestDur := gzipBestTimed(tarBytes)
-	if len(goBest) > 0 && len(goBest) < len(best) {
-		best = goBest
-	}
-
-	if goBestDur < floorDuration {
-		// The whole-stream zopfli pass and the per-entry zopfli pass cost
-		// about the same (both compress the full stream once), and the
-		// budget only affords one of them. Run the one whose pre-zopfli
-		// encoding is already smaller: per-entry splitting wins whenever
-		// entries want different encoders, and loses whenever entries
-		// share compressible structure across their boundaries.
-		asm, spans := assemblePerEntry(tarBytes)
+	if goDur := <-durCh; goDur < floorDuration {
+		spans := <-spanCh
+		asm := assembleAndVerify(spans, tarBytes)
 		if asm != nil && len(asm) < len(best) {
+			// The budget only affords one zopfli path, so run the one whose
+			// pre-zopfli encoding is already smaller: per-entry splitting
+			// wins whenever entries want different encoders, and loses
+			// whenever entries share compressible structure across their
+			// boundaries.
 			asm = zopfliEntries(start, spans)
 			if len(asm) > 0 && len(asm) < len(best) {
 				best = asm
@@ -170,18 +194,16 @@ type entrySpan struct {
 	ldWon bool
 }
 
-// assemblePerEntry partitions the decompressed tar into per-entry spans and
+// buildEntrySpans partitions the decompressed tar into per-entry spans and
 // encodes each span into its own gzip member with the smallest of the
-// libdeflate-12 and Go-flate candidates. The concatenation of members
-// gunzips back to exactly the input tar, so the result is a valid multi-
-// member gzip archive. Returns nil (with no spans) if the tar cannot be
-// walked safely — the caller then simply has no per-entry candidate.
-func assemblePerEntry(tar []byte) ([]byte, []entrySpan) {
+// libdeflate-12 and Go-flate candidates. It runs concurrently with the
+// whole-stream encodings (see run). Returns nil if the tar cannot be walked
+// safely — the caller then simply has no per-entry candidate.
+func buildEntrySpans(tar []byte) []entrySpan {
 	spans := tarSpans(tar)
 	if len(spans) == 0 {
-		return nil, nil
+		return nil
 	}
-	var out []byte
 	entries := make([]entrySpan, 0, len(spans))
 	for _, data := range spans {
 		e := entrySpan{data: data}
@@ -198,40 +220,70 @@ func assemblePerEntry(tar []byte) ([]byte, []entrySpan) {
 		case e.ld != nil:
 			e.best = e.ld
 		default:
-			return nil, nil
+			return nil
 		}
 		entries = append(entries, e)
-		out = append(out, e.best...)
 	}
-	// The assembly is built from hand-chosen encoders, so check that it
-	// really gunzips back to the input before offering it.
-	if !gunzipEquals(out, tar) {
-		return nil, nil
+	return entries
+}
+
+// assembleAndVerify concatenates the per-entry members back into one
+// multi-member gzip archive and checks that it gunzips to exactly the input
+// tar. The assembly is built from hand-chosen encoders, so the check guards
+// against a bad span walk producing a subtly wrong archive — a failed check
+// only loses the candidate, never the round. Returns nil if the spans are
+// unusable or the assembly does not verify.
+func assembleAndVerify(entries []entrySpan, want []byte) []byte {
+	if len(entries) == 0 {
+		return nil
 	}
-	return out, entries
+	var out []byte
+	for i := range entries {
+		out = append(out, entries[i].best...)
+	}
+	if !gunzipEquals(out, want) {
+		return nil
+	}
+	return out
 }
 
 // zopfliEntries adds a libzopfli candidate on entries where libdeflate
 // already beat Go's flate — the signal that the content rewards better
 // parsers. An entry keeps its zopfli member only if it comes out smaller
-// than the per-entry best. Passes run sequentially under the same
-// self-imposed deadline as tryZopfli: a pass that has not finished by the
-// deadline is abandoned along with the rest of the per-entry zopfli work,
-// leaving those entries with their earlier encodings.
+// than the per-entry best. All candidate entries compress concurrently
+// under the same self-imposed deadline as tryZopfli, so the wall-clock cost
+// is the slowest single pass rather than the sum; a pass that has not
+// finished by the deadline is abandoned along with the rest of the
+// per-entry zopfli work, leaving those entries with their earlier
+// encodings.
 func zopfliEntries(start time.Time, entries []entrySpan) []byte {
 	deadline := start.Add(budgetMultiple*floorDuration - zopfliKillMargin)
 
-	var out []byte
+	type zopfliResult struct {
+		idx int
+		enc []byte
+	}
+	results := make(chan zopfliResult, len(entries))
+	launched := 0
 	for i := range entries {
-		e := &entries[i]
-		if !e.ldWon || !time.Now().Before(deadline) {
-			out = append(out, e.best...)
+		if !entries[i].ldWon {
 			continue
 		}
-		if enc := zopfliOnce(deadline, e.data); len(enc) > 0 && len(enc) < len(e.best) {
-			e.best = enc
+		launched++
+		go func(idx int) {
+			results <- zopfliResult{idx, zopfliOnce(deadline, entries[idx].data)}
+		}(i)
+	}
+	for n := 0; n < launched; n++ {
+		r := <-results
+		if len(r.enc) > 0 && len(r.enc) < len(entries[r.idx].best) {
+			entries[r.idx].best = r.enc
 		}
-		out = append(out, e.best...)
+	}
+
+	var out []byte
+	for i := range entries {
+		out = append(out, entries[i].best...)
 	}
 	return out
 }
@@ -358,69 +410,35 @@ const zopfliKillMargin = 500 * time.Millisecond
 
 // tryZopfli compresses data with libzopfli under a deadline derived from
 // the (constant, floored) compute budget, measured from the process start
-// passed in. It first runs a single-iteration pass, which already finds
-// nearly all of the gain a zopfli run can offer; it only follows up with a
-// full fifteen-iteration pass when that first pass came back fast enough
-// that fifteen passes are still extrapolated to fit inside the deadline.
-// Each completed pass is reported as it finishes, and tryZopfli returns the
-// best result seen when the goroutine ends or the deadline hits, whichever
-// comes first — a pass abandoned at the deadline never discards an earlier
-// one that already finished.
+// passed in. A single-iteration pass already finds nearly all of the gain a
+// zopfli run offers, and the deeper multi-iteration passes only ever paid
+// off on files that sit far below the worst-of-7 aggregate — pure compute
+// for no measurable score — so only the single pass runs.
 //
-// The passes run on a separate goroutine rather than inline: a
+// The pass runs on a separate goroutine rather than inline: a
 // ZopfliCompress call cannot be interrupted, but main writing its fallback
 // and exiting the process stops the abandoned goroutine's work anyway.
-// Returns nil if no pass finished.
+// Returns nil if no result arrived before the deadline.
 func tryZopfli(start time.Time, data []byte) []byte {
 	budget := budgetMultiple * floorDuration
 	deadline := start.Add(budget - zopfliKillMargin)
 
-	results := make(chan []byte, 2)
-	done := make(chan struct{})
+	results := make(chan []byte, 1)
 	go func() {
-		defer close(done)
-		firstStart := time.Now()
-		first, ok := zopfliGzip(data, 1)
-		if !ok {
-			return
-		}
-		results <- first
-		// Fifteen iterations cost over fifteen times a single pass only
-		// when per-iteration work dominates the fixed block-splitting and
-		// LZ77 cost — on small inputs the fixed cost makes the full run far
-		// cheaper in relative terms (measured: ~3.5x on small files, ~8x on
-		// a large one). Ten is a conservative upper bound for both regimes.
-		if time.Since(firstStart)*10 >= time.Until(deadline) {
-			return
-		}
-		if second, ok := zopfliGzip(data, 15); ok && len(second) < len(first) {
-			results <- second
+		if enc, ok := zopfliGzip(data, 1); ok {
+			results <- enc
+		} else {
+			results <- nil
 		}
 	}()
 
-	var best []byte
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	for {
-		select {
-		case enc := <-results:
-			if len(best) == 0 || len(enc) < len(best) {
-				best = enc
-			}
-		case <-done:
-			for {
-				select {
-				case enc := <-results:
-					if len(best) == 0 || len(enc) < len(best) {
-						best = enc
-					}
-				default:
-					return best
-				}
-			}
-		case <-timer.C:
-			return best
-		}
+	select {
+	case enc := <-results:
+		return enc
+	case <-timer.C:
+		return nil
 	}
 }
 
