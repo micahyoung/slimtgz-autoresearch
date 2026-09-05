@@ -14,6 +14,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -196,33 +199,60 @@ type entrySpan struct {
 
 // buildEntrySpans partitions the decompressed tar into per-entry spans and
 // encodes each span into its own gzip member with the smallest of the
-// libdeflate-12 and Go-flate candidates. It runs concurrently with the
-// whole-stream encodings (see run). Returns nil if the tar cannot be walked
-// safely — the caller then simply has no per-entry candidate.
+// libdeflate-12 and Go-flate candidates. Spans are independent, so they are
+// encoded on a pool of GOMAXPROCS workers instead of one after another —
+// the pool also caps how many libdeflate compressors are alive at once,
+// which keeps memory flat for archives with thousands of small entries.
+// It runs concurrently with the whole-stream encodings (see run). Returns
+// nil if the tar cannot be walked safely or any span has no usable
+// encoding — the caller then simply has no per-entry candidate.
 func buildEntrySpans(tar []byte) []entrySpan {
 	spans := tarSpans(tar)
 	if len(spans) == 0 {
 		return nil
 	}
-	entries := make([]entrySpan, 0, len(spans))
-	for _, data := range spans {
-		e := entrySpan{data: data}
-		if ld, ok := libdeflateGzip(data, 12); ok {
-			e.ld = ld
-		}
-		e.gom = gzipBest(data)
-		switch {
-		case e.ld != nil && (e.gom == nil || len(e.ld) < len(e.gom)):
-			e.best = e.ld
-			e.ldWon = true
-		case e.gom != nil:
-			e.best = e.gom
-		case e.ld != nil:
-			e.best = e.ld
-		default:
-			return nil
-		}
-		entries = append(entries, e)
+	entries := make([]entrySpan, len(spans))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(spans) {
+		workers = len(spans)
+	}
+	idx := make(chan int, len(spans))
+	for i := range spans {
+		idx <- i
+	}
+	close(idx)
+
+	var failed atomic.Bool
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idx {
+				e := entrySpan{data: spans[i]}
+				if ld, ok := libdeflateGzip(spans[i], 12); ok {
+					e.ld = ld
+				}
+				e.gom = gzipBest(spans[i])
+				switch {
+				case e.ld != nil && (e.gom == nil || len(e.ld) < len(e.gom)):
+					e.best = e.ld
+					e.ldWon = true
+				case e.gom != nil:
+					e.best = e.gom
+				case e.ld != nil:
+					e.best = e.ld
+				default:
+					failed.Store(true)
+					return
+				}
+				entries[i] = e
+			}
+		}()
+	}
+	wg.Wait()
+	if failed.Load() {
+		return nil
 	}
 	return entries
 }
