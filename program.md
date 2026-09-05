@@ -9,13 +9,12 @@ nothing in it is required for the work below.)
 
 ## The task
 
-`data/` holds seven real-world `.tar.gz` files: OCI container filesystem
+`data/` holds six real-world `.tar.gz` files: OCI container filesystem
 layers (`alpine-amd64`, `alpine-arm64`, `busybox-amd64`, `busybox-arm64`),
-a synthetic pathologically-compressible archive (`zipbomb`), the original
-1991 Linux 0.01 kernel source (`linux001`), and id Software's original 1997
-Doom source release (`doomsrc`). The goal is a CLI, `train.go`, that reads a
-`.tar.gz` file and writes a smaller-or-equal-size `.tar.gz` copy that
-re-extracts to exactly the same content.
+the original 1991 Linux 0.01 kernel source (`linux001`), and id Software's
+original 1997 Doom source release (`doomsrc`). The goal is a CLI, `train.go`,
+that reads a `.tar.gz` file and writes a smaller-or-equal-size `.tar.gz` copy
+that re-extracts to exactly the same content.
 
 **The hard invariant**: for every file name present in the input, gunzip+
 tar-extracting the output must produce an entry under that same name with
@@ -49,7 +48,7 @@ Run a round with:
 go run prepare.go
 ```
 
-This builds your current `train.go`, runs it against all seven dataset
+This builds your current `train.go`, runs it against all six dataset
 files (each as `train <in> <out>`), verifies the round-trip invariant, and
 prints a per-file and aggregate result.
 
@@ -67,10 +66,10 @@ added here.
 3. Run `go run prepare.go`. Read the full output: per-file `ratio` and
    `compute`, and the `AGGREGATE LOSS` / `COMPUTE RATIO` lines.
 4. **Two numbers matter, and they're kept separate on purpose**:
-   - `AGGREGATE LOSS` — `max()` of all seven files' `output_size /
-     input_size` (worst-of-7, not an average: a great ratio on some files
+   - `AGGREGATE LOSS` — `max()` of all six files' `output_size /
+     input_size` (worst-of-6, not an average: a great ratio on some files
      must never mask a failure on another), lower is better.
-   - `COMPUTE RATIO` — `max()` across the seven files of how many times
+   - `COMPUTE RATIO` — `max()` across the six files of how many times
      longer `train.go` took than an in-process `gzip.BestCompression` pass
      over the same content took, lower is simpler/cheaper. Each file gets
      its own budget of 100x its own baseline, so this cap scales with input
@@ -97,7 +96,7 @@ added here.
 
    ```
    git add slimtgz-autoresearch
-   git commit -m "slimtgz-autoresearch round N: loss=X.XXXX (alpine-amd64=A alpine-arm64=B busybox-amd64=C busybox-arm64=D zipbomb=E linux001=F doomsrc=G)
+   git commit -m "slimtgz-autoresearch round N: loss=X.XXXX (alpine-amd64=A alpine-arm64=B busybox-amd64=C busybox-arm64=D linux001=E doomsrc=F)
 
    one-line description of what changed and why"
    ```

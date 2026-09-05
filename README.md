@@ -19,7 +19,7 @@ itself doesn't.
 | `program.md` | human-authored, agent-read | the in-the-box operational briefing |
 | `README.md` | this file | out-of-the-box human context |
 | `go.mod` | fixed, human-only | Go module definition; stdlib only unless a round needs more |
-| `data/` | fixed | the seven dataset files (see *Dataset provenance* below) |
+| `data/` | fixed | the six dataset files (see *Dataset provenance* below) |
 | `out/` | scratch, gitignored | each round's rendered `$2` outputs |
 
 `prepare.go` refuses to run if `README.md`, `program.md`, or `prepare.go`
@@ -79,7 +79,7 @@ scorable result. See `program.md`'s workflow section for the exact policy.
 
 ## Dataset provenance
 
-All seven files were fetched or generated on 2026-09-01. sha256 checksums
+All six files were fetched or generated on 2026-09-01. sha256 checksums
 below are of the exact bytes committed to `data/`.
 
 | File | Source | sha256 |
@@ -88,13 +88,12 @@ below are of the exact bytes committed to `data/`.
 | `alpine-arm64.tar.gz` | `alpine:latest`, `linux/arm64`, same method | `5de55e5ef9c033997441461efe7ba23a986db059c0bb78b38f84ee0d72b99167` |
 | `busybox-amd64.tar.gz` | `busybox:latest`, `linux/amd64`, same method | `b05093807bb0294152bb9cf86d64da722732dddaf7f8882fa1f120477dbc4db3` |
 | `busybox-arm64.tar.gz` | `busybox:latest`, `linux/arm64`, same method | `025fe1949698376d1d9a946f8a39a3529ad3ea540ca92b78c6cd041deb19d63e` |
-| `zipbomb-lookalike.tar.gz` | Synthesized locally, not derived from the real 42.zip (which fully unpacks to ~4.5PB and is unsafe to touch even partially). Three files (~20MB all-zero, ~20MB repeating 1KB pattern, ~9.4MB mixed sparse-zero/random blocks) tarred and gzipped, inspired by 42.zip's pathological-compressibility shape at a safe, bounded size | `c4a58bf4bc5bbe9c739a881092b80d80b99aa675b18e02f436165453866b3c44` |
 | `linux-0.01.tar.gz` | Linus Torvalds' original 1991 Linux 0.01 kernel source release, fetched from `https://mirrors.edge.kernel.org/pub/linux/kernel/Historic/linux-0.01.tar.gz` — checksum matches kernel.org's own published `sha256sums.asc` for this file | `24454f830cdb571e2c4ad15481119c43b3cafd48dd869a9b2945d1036d1dc68d` |
 | `doomsrc.tgz` | id Software's official 1997 Doom source release. Fetched `idstuff/source/doomsrc.zip` (id 8802 in the idgames archive, mirrored at `https://youfailit.net/pub/idgames/`) and extracted its inner `linuxdoom-1.10.src.tgz` unmodified — that inner file is itself the authentic tgz id Software originally packaged | `e178853e9878b205bba177191a871aae76be3c69c83b4e127de63275070b9e6b` |
 
 ## Known limitations
 
-- **Seven files is still a small dataset**, same limitation screencam notes
+- **Six files is still a small dataset**, same limitation screencam notes
   for its five photos. The off-limits-`prepare.go` rule stops literal
   cheating, but nothing stops `train.go` from branching on a file's exact
   size or byte signature in a technically-compliant but overfit way.

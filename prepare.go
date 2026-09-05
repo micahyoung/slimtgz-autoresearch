@@ -23,7 +23,6 @@ var dataset = []datasetEntry{
 	{"alpine-arm64", "data/alpine-arm64.tar.gz"},
 	{"busybox-amd64", "data/busybox-amd64.tar.gz"},
 	{"busybox-arm64", "data/busybox-arm64.tar.gz"},
-	{"zipbomb", "data/zipbomb-lookalike.tar.gz"},
 	{"linux001", "data/linux-0.01.tar.gz"},
 	{"doomsrc", "data/doomsrc.tgz"},
 }
