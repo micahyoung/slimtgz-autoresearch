@@ -44,8 +44,9 @@ func main() {
 //   - the original input bytes themselves
 //   - libzopfli (the engine the zopfli CLI is built on) — either over the
 //     whole stream or per tar entry, whichever side the pre-zopfli sizes
-//     favor; the whole-stream side starts at one iteration and refines to
-//     fifteen when the first pass left the budget's deadline far away
+//     favor; the whole-stream side runs at fifteen iterations, split across
+//     as many goroutines as its measured cost needs to finish inside the
+//     deadline (see zopfliChunks)
 //   - a per-tar-entry decomposition: each entry re-encoded into its own
 //     gzip member with the smallest of the encoders above, so encoders can
 //     be mixed entry-by-entry where a single whole-stream encoding has to
@@ -62,14 +63,16 @@ func main() {
 // terms against a single-threaded baseline, so overlapping independent work
 // is pure savings.
 //
-// The libzopfli candidates only run on inputs that compress well enough in
-// Go's flate that the compute budget is governed by the fixed floor rather
-// than by a measured time (see floorDuration). For those inputs the budget
-// is a known constant, so zopfli can be given a self-imposed deadline below
-// it and never risks blowing the budget: a libzopfli call cannot be
-// interrupted, so past the deadline the zopfli helpers abandon the goroutine
-// they are running on and return nothing, and the encoder simply falls back
-// to the other candidates.
+// The libzopfli candidates are the expensive ones, so they run under a
+// self-imposed deadline placed safely inside the budget this process
+// computes for itself: the timed Go-BestCompression pass is the same
+// measurement the budget is built from, so its duration (floored the same
+// way) says how big that budget is. Even so the estimate is only as good as
+// that measurement, hence budgetPercent well below 100. A libzopfli call
+// cannot be interrupted either, so past the deadline the zopfli helpers
+// abandon the
+// goroutine they are running on and return nothing, falling back to the
+// other candidates.
 //
 // The original-input candidate is the reason this tool is always at worst a
 // no-op rewrite: Go's flate is weaker than the zlib-class compressors that
@@ -136,30 +139,34 @@ func run(inPath, outPath string) error {
 		best = res.ld
 	}
 
-	if goDur := <-durCh; goDur < floorDuration {
-		// The budget only affords one whole-stream zopfli pass, so give it
-		// the tar whose matching libdeflate pass is smaller — a smaller
-		// pre-zopfli size is the same signal that decides the per-entry
-		// versus whole-stream zopfli path below.
-		zdata := tarBytes
-		if res.tar != nil && rawLd != nil && len(res.ld) < len(rawLd) {
-			zdata = res.tar
+	goDur := <-durCh
+	// The budget is built from a timed Go-BestCompression pass, and goDur is
+	// this process's own measurement of exactly that pass over exactly these
+	// bytes, so flooring it the same way recovers the budget's size.
+	// budgetPercent of that, minus the write-out margin, is the deadline the
+	// zopfli work has to respect.
+	budget := time.Duration(budgetMultiple) * max(goDur, floorDuration)
+	deadline := start.Add(budget*budgetPercent/100 - zopfliKillMargin)
+
+	// Only one zopfli path fits in the budget, so take the one whose
+	// pre-zopfli encoding is already smaller: per-entry splitting wins
+	// whenever entries want different encoders, and loses whenever entries
+	// share compressible structure across their boundaries. Give that path
+	// the tar whose matching libdeflate pass is smaller — a smaller
+	// pre-zopfli size is the same signal.
+	zdata := tarBytes
+	if res.tar != nil && rawLd != nil && len(res.ld) < len(rawLd) {
+		zdata = res.tar
+	}
+	spans := <-spanCh
+	asm := assembleAndVerify(spans, tarBytes)
+	if asm != nil && len(asm) < len(best) {
+		asm = zopfliEntries(deadline, spans)
+		if len(asm) > 0 && len(asm) < len(best) {
+			best = asm
 		}
-		spans := <-spanCh
-		asm := assembleAndVerify(spans, tarBytes)
-		if asm != nil && len(asm) < len(best) {
-			// The budget only affords one zopfli path, so run the one whose
-			// pre-zopfli encoding is already smaller: per-entry splitting
-			// wins whenever entries want different encoders, and loses
-			// whenever entries share compressible structure across their
-			// boundaries.
-			asm = zopfliEntries(start, spans)
-			if len(asm) > 0 && len(asm) < len(best) {
-				best = asm
-			}
-		} else if enc := tryZopfli(start, zdata); len(enc) != 0 && len(enc) < len(best) {
-			best = enc
-		}
+	} else if enc := tryZopfli(deadline, goDur, zdata); len(enc) != 0 && len(enc) < len(best) {
+		best = enc
 	}
 
 	out, err := os.Create(outPath)
@@ -447,9 +454,7 @@ func assembleAndVerify(entries []entrySpan, want []byte) []byte {
 // finished by the deadline is abandoned along with the rest of the
 // per-entry zopfli work, leaving those entries with their earlier
 // encodings.
-func zopfliEntries(start time.Time, entries []entrySpan) []byte {
-	deadline := start.Add(budgetMultiple*floorDuration - zopfliKillMargin)
-
+func zopfliEntries(deadline time.Time, entries []entrySpan) []byte {
 	type zopfliResult struct {
 		idx int
 		enc []byte
@@ -586,138 +591,146 @@ func tarSize(b []byte) (int64, bool) {
 }
 
 // floorDuration mirrors the fixed lower bound the compute budget is measured
-// against. An input whose Go-BestCompression pass finishes faster than this
-// gets a budget that is exactly budgetMultiple*floorDuration — a constant —
-// which is what makes a safe zopfli deadline possible.
+// against: an input whose Go-BestCompression pass finishes faster than this
+// gets a budget built from the floor rather than from the measured time, so
+// measurement noise on a tiny input cannot collapse the budget to nothing.
 const floorDuration = 200 * time.Millisecond
 
 // budgetMultiple is how many times the (floored) baseline the per-file
 // compute budget spans.
 const budgetMultiple = 100
 
+// budgetPercent is how much of that budget the zopfli deadline is allowed to
+// use. The budget is recovered from this process's own timing of the same
+// pass the budget is built from, so it is the same quantity rather than a
+// guess — but the two timings are taken at different moments, and the
+// zopfli work starts some way into the process, so the deadline keeps a
+// sizeable slice of the budget in reserve.
+const budgetPercent = 70
+
+// zopfliIterations is how many refinement passes libzopfli makes over a
+// whole-stream candidate. Past this, measured gains on this dataset flatten
+// out while the cost keeps climbing.
+const zopfliIterations = 15
+
+// zopfliSerialFactor converts the measured Go-BestCompression duration into
+// an estimate of a whole-stream zopfli pass at zopfliIterations. Measured on
+// this dataset the ratio runs 30-60x depending on the content, so the
+// estimate deliberately sits at the pessimistic end.
+const zopfliSerialFactor = 60
+
 // zopfliKillMargin is how far before that budget's expiry tryZopfli gives
 // up waiting, so the fallback candidates can still be written out.
 const zopfliKillMargin = 500 * time.Millisecond
 
-// tryZopfli compresses data with libzopfli under a deadline derived from
-// the (constant, floored) compute budget, measured from the process start
-// passed in. It runs a single-iteration pass first and, when that finished
-// with the deadline still far away, refines with a full 15-iteration pass —
-// on the small inputs this path admits, 15 iterations beat 1 often enough
-// to be the difference between beating and losing to the other encoders.
-// On inputs above zopfliChunkThreshold the refinement runs chunk-parallel
-// (see zopfliRefine), trading a few KB for a several-fold shorter wall clock.
+// tryZopfli compresses data with libzopfli at zopfliIterations under the
+// given deadline. baseline is the measured Go-BestCompression pass, scaled
+// by zopfliSerialFactor to predict what the pass will cost, and the pass is
+// split across as many goroutines as that prediction needs in order to fit
+// (see zopfliChunks) — a single ZopfliCompress call is single-threaded and
+// takes tens of seconds on the larger dataset files.
 //
 // The pass runs on a separate goroutine rather than inline: a
 // ZopfliCompress call cannot be interrupted, but main writing its fallback
 // and exiting the process stops the abandoned goroutine's work anyway.
-// Returns nil if no result arrived before the deadline.
-func tryZopfli(start time.Time, data []byte) []byte {
-	budget := budgetMultiple * floorDuration
-	deadline := start.Add(budget - zopfliKillMargin)
+// Returns nil if no result arrived before the deadline, or if the predicted
+// cost does not fit even fully split.
+func tryZopfli(deadline time.Time, baseline time.Duration, data []byte) []byte {
+	n := zopfliChunks(time.Duration(zopfliSerialFactor)*baseline, len(data), deadline)
+	if n == 0 {
+		return nil
+	}
 
-	results := make(chan []byte, 2)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		firstStart := time.Now()
-		first, ok := zopfliGzip(data, 1)
-		if !ok {
-			return
-		}
-		results <- first
-		// Fifteen iterations cost over fifteen times a single pass only
-		// when per-iteration work dominates the fixed block-splitting and
-		// LZ77 cost — on small inputs the fixed cost makes the full run far
-		// cheaper in relative terms (measured: ~3.5x on small files, ~8x on
-		// a large one). Ten is a conservative upper bound for both regimes.
-		// The bound is against the serial whole-stream cost, which only
-		// gets cheaper under chunking, so it stays safe.
-		if time.Since(firstStart)*10 >= time.Until(deadline) {
-			return
-		}
-		if second := zopfliRefine(data); len(second) > 0 && len(second) < len(first) {
-			results <- second
-		}
-	}()
+	results := make(chan []byte, 1)
+	go func() { results <- zopfliRefine(data, n) }()
 
-	var best []byte
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	for {
-		select {
-		case enc := <-results:
-			if len(best) == 0 || len(enc) < len(best) {
-				best = enc
-			}
-		case <-done:
-			for {
-				select {
-				case enc := <-results:
-					if len(best) == 0 || len(enc) < len(best) {
-						best = enc
-					}
-				default:
-					return best
-				}
-			}
-		case <-timer.C:
-			return best
+	select {
+	case enc := <-results:
+		return enc
+	case <-timer.C:
+		return nil
+	}
+}
+
+// zopfliChunks picks how many parallel gzip members a whole-stream zopfli
+// pass is cut into. estSerial is the predicted wall-clock cost of one call
+// over the whole input; cutting it into members costs a little size at each
+// cut but is close to linear in wall clock, so the count is the smallest one
+// whose predicted time fits in three quarters of what is left before the
+// deadline. The quarter is slack, not parsimony: the estimate is a scaled
+// guess, and a pass still running when the deadline passes is abandoned
+// along with the whole candidate, which is worse than one extra cut. Returns
+// 0 when even one member per core cannot fit, so the caller skips the
+// candidate; inputs below zopfliChunkThreshold always get one member, where
+// the serial pass is fast enough that a cut could only lose size.
+func zopfliChunks(estSerial time.Duration, size int, deadline time.Time) int {
+	if size < zopfliChunkThreshold {
+		return 1
+	}
+	avail := time.Until(deadline)
+	limit := runtime.GOMAXPROCS(0)
+	for n := 1; ; n++ {
+		if estSerial/time.Duration(n) <= avail*3/4 {
+			return n
+		}
+		if n >= limit {
+			return 0
 		}
 	}
 }
 
-// zopfliChunkThreshold is the input size at and above which the
-// tryZopfli refinement splits its 15-iteration pass across goroutines. A
-// single ZopfliCompress call is single-threaded, so on a multi-core box the
-// serial pass wastes every core but one; the whole-stream cost for a file
-// big enough to chunk is several seconds, while chunked it is roughly that
-// divided by the chunk count.
+// zopfliBlockSplitMax caps how many deflate blocks libzopfli may split a
+// stream into. Its own default of 15 is far below what a multi-megabyte tar
+// stream wants — the content alternates between megabyte binaries and runs
+// of near-identical 512-byte headers, each wanting its own block — and at
+// the default libzopfli loses to libdeflate's optimal parse on this
+// dataset, while at 63 it wins on every file it is tried on. 15 iterations
+// cost less than 63x of one iteration because block-splitting work is
+// amortised, and the measured cost of 63 over 15 is well inside what the
+// budget affords once the pass is chunk-parallel.
+const zopfliBlockSplitMax = 63
+
+// zopfliChunkThreshold is the input size below which the whole-stream zopfli
+// pass runs as a single member: splitting is a wall-clock tool, and a pass
+// this small does not need one.
 const zopfliChunkThreshold = 512 << 10
 
-// zopfliRefine runs the 15-iteration refinement pass. Below the chunk
-// threshold it is one whole-stream pass. Above it the input is cut into
-// zopfliChunkCount equal, 512-byte-aligned pieces compressed concurrently
-// as independent gzip members; concatenating lossless members reproduces
-// the input exactly regardless of where the cuts land, and the assembled
-// stream is gunzip-verified before being offered as a candidate. The split
-// pays each member's own Huffman tables and loses the matches across its
-// boundary — measured at ~1.6KB per boundary on doomsrc-class text while
-// roughly halving-to-quartering the wall clock — so it is only worth taking
-// where the candidate it improves has room to spare, which the min() over
-// all candidates enforces automatically. The superlinear per-iteration
-// fixed cost of small chunks makes four the fastest split measured on
-// doomsrc (N=2: 2.2s, N=4: 1.4s, N=8: 1.9s), so more chunks than cores do
-// not help either, and the chunk count is clamped to the cores available.
-// Returns nil if any member failed to encode or the assembly does not
-// verify.
-func zopfliRefine(data []byte) []byte {
-	if len(data) < zopfliChunkThreshold {
-		second, ok := zopfliGzip(data, 15)
+// zopfliRefine runs the zopfliIterations whole-stream pass, either as one
+// member or cut into n equal, 512-byte-aligned pieces compressed
+// concurrently. Concatenating lossless members reproduces the input exactly
+// regardless of where the cuts land, and the assembled stream is
+// gunzip-verified before being returned. The cuts pay each member's own
+// Huffman tables and lose the matches across the boundary — measured at
+// well under 1KB per cut on this dataset's larger files, against a wall
+// clock roughly divided by n — so zopfliChunks asks for as few of them as
+// the deadline allows. Returns nil if any member failed to encode or the
+// assembly does not verify.
+func zopfliRefine(data []byte, n int) []byte {
+	if n == 1 {
+		enc, ok := zopfliGzip(data, zopfliIterations)
 		if !ok {
 			return nil
 		}
-		return second
+		return enc
 	}
 
-	n := 4
-	if g := runtime.GOMAXPROCS(0); g < n {
-		n = g
-	}
 	bounds := make([]int, n+1)
 	for i := range bounds {
 		b := i * len(data) / n
 		bounds[i] = b - b%512
 	}
+	bounds[n] = len(data)
 
 	members := make([][]byte, n)
-	var okFlags [4]bool
+	okFlags := make([]bool, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if enc, ok := zopfliGzip(data[bounds[i]:bounds[i+1]], 15); ok {
+			if enc, ok := zopfliGzip(data[bounds[i]:bounds[i+1]], zopfliIterations); ok {
 				members[i] = enc
 				okFlags[i] = true
 			}
@@ -749,7 +762,7 @@ func zopfliGzip(data []byte, iterations int) ([]byte, bool) {
 	C.ZopfliInitOptions(&opts)
 	opts.numiterations = C.int(iterations)
 	opts.blocksplitting = 1
-	opts.blocksplittingmax = 15
+	opts.blocksplittingmax = C.int(zopfliBlockSplitMax)
 
 	var cOut *C.uchar
 	var cOutSize C.size_t
