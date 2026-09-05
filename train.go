@@ -46,7 +46,9 @@ func main() {
 //     whole stream or per tar entry, whichever side the pre-zopfli sizes
 //     favor; the whole-stream side runs at fifteen iterations, split across
 //     as many goroutines as its measured cost needs to finish inside the
-//     deadline (see zopfliChunks)
+//     deadline (see zopfliChunks), and in addition once unsplit over the
+//     whole stream from t≈0 — that pass pays no cut cost and is kept when it
+//     finishes in time and comes out smallest (see speculativeZopfli)
 //   - a per-tar-entry decomposition: each entry re-encoded into its own
 //     gzip member with the smallest of the encoders above, so encoders can
 //     be mixed entry-by-entry where a single whole-stream encoding has to
@@ -89,6 +91,22 @@ func run(inPath, outPath string) error {
 	tarBytes, err := gunzipAll(inBytes)
 	if err != nil {
 		return err
+	}
+
+	// Speculative single-member whole-stream zopfli pass, started here at t≈0
+	// over the raw tar bytes: the chunked pass below cuts the stream into
+	// members to fit the deadline and each cut costs size, so when the actual
+	// pass would have fit whole anyway the cut is pure loss. This candidate
+	// is the same pass without any cuts, kept only if it finishes before the
+	// deadline it is handed once the budget is known (see speculativeZopfli);
+	// the chunked path stays its insurance for when it does not. It costs one
+	// core the other candidates barely use, and inputs small enough that the
+	// chunked path never cuts skip it.
+	var z1Ch chan []byte
+	deadlineCh := make(chan time.Time, 1)
+	if len(tarBytes) >= zopfliChunkThreshold {
+		z1Ch = make(chan []byte, 1)
+		go speculativeZopfli(z1Ch, deadlineCh, tarBytes)
 	}
 
 	// Whole-stream libdeflate, whole-stream Go flate, the per-entry
@@ -147,6 +165,9 @@ func run(inPath, outPath string) error {
 	// zopfli work has to respect.
 	budget := time.Duration(budgetMultiple) * max(goDur, floorDuration)
 	deadline := start.Add(budget*budgetPercent/100 - zopfliKillMargin)
+	if z1Ch != nil {
+		deadlineCh <- deadline
+	}
 
 	// Only one zopfli path fits in the budget, so take the one whose
 	// pre-zopfli encoding is already smaller: per-entry splitting wins
@@ -167,6 +188,11 @@ func run(inPath, outPath string) error {
 		}
 	} else if enc := tryZopfli(deadline, goDur, zdata); len(enc) != 0 && len(enc) < len(best) {
 		best = enc
+	}
+	if z1Ch != nil {
+		if enc := <-z1Ch; len(enc) > 0 && len(enc) < len(best) {
+			best = enc
+		}
 	}
 
 	out, err := os.Create(outPath)
@@ -622,6 +648,32 @@ const zopfliSerialFactor = 60
 // zopfliKillMargin is how far before that budget's expiry tryZopfli gives
 // up waiting, so the fallback candidates can still be written out.
 const zopfliKillMargin = 500 * time.Millisecond
+
+// speculativeZopfli runs the single-member whole-stream pass and sends the
+// result on out (nil if it did not finish in time). It starts immediately —
+// before the deadline exists, since the deadline comes from the timed Go pass
+// running alongside it — and is handed the deadline on deadlineCh once the
+// caller has computed it. A ZopfliCompress call cannot be interrupted, so a
+// pass still running then is abandoned along with the goroutine running it,
+// and nil goes out so the caller keeps the chunked candidate.
+func speculativeZopfli(out chan<- []byte, deadlineCh <-chan time.Time, data []byte) {
+	deadline := <-deadlineCh
+	results := make(chan []byte, 1)
+	go func() {
+		if enc, ok := zopfliGzip(data, zopfliIterations); ok {
+			results <- enc
+		}
+	}()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case enc := <-results:
+		out <- enc
+	case <-timer.C:
+		out <- nil
+	}
+}
 
 // tryZopfli compresses data with libzopfli at zopfliIterations under the
 // given deadline. baseline is the measured Go-BestCompression pass, scaled
