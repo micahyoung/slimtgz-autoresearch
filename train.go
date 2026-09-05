@@ -590,9 +590,10 @@ func tarSpans(tar []byte) [][]byte {
 	return spans
 }
 
-// tarSize reads a tar header's size field: standard octal, or GNU base-256
-// when the high bit of the first byte is set. ok is false for a field
-// without a usable value.
+// tarSize reads a tar header's size field: standard octal — left-padded with
+// zeroes the way Go's tar writer emits it, or right-justified with leading
+// spaces the way v7/old GNU tar wrote it — or GNU base-256 when the high bit
+// of the first byte is set. ok is false for a field without a usable value.
 func tarSize(b []byte) (int64, bool) {
 	if b[0]&0x80 != 0 {
 		v := int64(b[0] & 0x7f)
@@ -604,6 +605,9 @@ func tarSize(b []byte) (int64, bool) {
 	var v int64
 	sawDigit := false
 	for _, c := range b {
+		if !sawDigit && c == ' ' {
+			continue
+		}
 		if c == 0 || c == ' ' {
 			break
 		}
