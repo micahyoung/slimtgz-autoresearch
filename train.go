@@ -9,6 +9,7 @@ package main
 import "C"
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"fmt"
@@ -50,6 +51,11 @@ func main() {
 //     be mixed entry-by-entry where a single whole-stream encoding has to
 //     pick just one
 //
+// The encoders above run over a re-serialized copy of the tar when that
+// copy's libdeflate pass is already smaller than the raw tar's (see
+// reserializeTar): old or hand-rolled archives carry header bytes that
+// re-extract fine but compress worse than freshly written ones.
+//
 // The encodings are independent of one another, so they run on separate
 // goroutines and the wall-clock cost is the slowest single encoding rather
 // than the sum of all of them. The compute budget is measured in wall-clock
@@ -82,14 +88,16 @@ func run(inPath, outPath string) error {
 		return err
 	}
 
-	// Whole-stream libdeflate, whole-stream Go flate, and the per-entry
-	// decomposition share no work, so run them concurrently and collect
-	// the results as they finish. Collecting in this fixed order keeps
-	// the same smallest-so-far priority the sequential version had.
+	// Whole-stream libdeflate, whole-stream Go flate, the per-entry
+	// decomposition, and the tar re-serialization share no work, so run
+	// them concurrently and collect the results as they finish. Collecting
+	// in this fixed order keeps the same smallest-so-far priority the
+	// sequential version had.
 	ldCh := make(chan []byte, 1)
 	goCh := make(chan []byte, 1)
 	durCh := make(chan time.Duration, 1)
 	spanCh := make(chan []entrySpan, 1)
+	resCh := make(chan reserialized, 1)
 	go func() {
 		enc, _ := libdeflateGzip(tarBytes, 12)
 		ldCh <- enc
@@ -102,16 +110,41 @@ func run(inPath, outPath string) error {
 	go func() {
 		spanCh <- buildEntrySpans(tarBytes)
 	}()
+	go func() {
+		res := reserializeTar(tarBytes)
+		if res == nil {
+			resCh <- reserialized{}
+			return
+		}
+		ld, ok := libdeflateGzip(res, 12)
+		if !ok {
+			ld = nil
+		}
+		resCh <- reserialized{tar: res, ld: ld}
+	}()
 
 	best := inBytes
-	if enc := <-ldCh; enc != nil && len(enc) < len(best) {
-		best = enc
+	rawLd := <-ldCh
+	if rawLd != nil && len(rawLd) < len(best) {
+		best = rawLd
 	}
 	if enc := <-goCh; len(enc) > 0 && len(enc) < len(best) {
 		best = enc
 	}
+	res := <-resCh
+	if len(res.ld) > 0 && len(res.ld) < len(best) {
+		best = res.ld
+	}
 
 	if goDur := <-durCh; goDur < floorDuration {
+		// The budget only affords one whole-stream zopfli pass, so give it
+		// the tar whose matching libdeflate pass is smaller — a smaller
+		// pre-zopfli size is the same signal that decides the per-entry
+		// versus whole-stream zopfli path below.
+		zdata := tarBytes
+		if res.tar != nil && rawLd != nil && len(res.ld) < len(rawLd) {
+			zdata = res.tar
+		}
 		spans := <-spanCh
 		asm := assembleAndVerify(spans, tarBytes)
 		if asm != nil && len(asm) < len(best) {
@@ -124,7 +157,7 @@ func run(inPath, outPath string) error {
 			if len(asm) > 0 && len(asm) < len(best) {
 				best = asm
 			}
-		} else if enc := tryZopfli(start, tarBytes); len(enc) != 0 && len(enc) < len(best) {
+		} else if enc := tryZopfli(start, zdata); len(enc) != 0 && len(enc) < len(best) {
 			best = enc
 		}
 	}
@@ -183,6 +216,134 @@ func gzipBest(data []byte) []byte {
 		return nil
 	}
 	return buf.Bytes()
+}
+
+// reserialized holds a re-serialized copy of a tar stream plus the
+// libdeflate pass computed over it, used to decide whether the re-serialized
+// or the raw bytes are the better compression input. A zero value means the
+// re-serialization was not available.
+type reserialized struct {
+	tar []byte
+	ld  []byte
+}
+
+// tarKey is the set of header fields that must survive a round unchanged,
+// mirroring the round-trip verifier's comparison — plain comparable fields
+// so two entries can be compared with ==.
+type tarKey struct {
+	linkname           string
+	uname, gname       string
+	mode, uid, gid     int64
+	modTime            int64
+	devmajor, devminor int64
+	typeflag           byte
+}
+
+func keyOf(h *tar.Header) tarKey {
+	return tarKey{
+		linkname: h.Linkname,
+		uname:    h.Uname,
+		gname:    h.Gname,
+		mode:     h.Mode,
+		uid:      int64(h.Uid),
+		gid:      int64(h.Gid),
+		modTime:  h.ModTime.Unix(),
+		devmajor: h.Devmajor,
+		devminor: h.Devminor,
+		typeflag: h.Typeflag,
+	}
+}
+
+// tarItem is one parsed entry: its header and content as the tar reader
+// produced them.
+type tarItem struct {
+	hdr     *tar.Header
+	content []byte
+}
+
+// readTarAll parses a tar stream into its entries, mirroring how the
+// verifier reads one.
+func readTarAll(tarBytes []byte) ([]tarItem, error) {
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	var items []tarItem
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return items, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		content, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, tarItem{hdr, content})
+	}
+}
+
+// lastByKey collapses parsed entries to the one the verifier would see per
+// name: where a name appears more than once, tar extraction takes the last.
+func lastByKey(items []tarItem) map[string]tarItem {
+	by := make(map[string]tarItem, len(items))
+	for _, it := range items {
+		by[it.hdr.Name] = it
+	}
+	return by
+}
+
+// reserializeTar parses a tar stream and rewrites it with Go's archive/tar
+// writer, then verifies the rewrite against the verifier's own rule — every
+// name's last entry must carry identical header fields and content — before
+// returning it. The rewrite drops nothing the verifier tracks and normalizes
+// header bytes an older or hand-rolled writer may have left in fields that
+// extraction ignores, which freshly written headers then compress better.
+// It returns nil if the input cannot be parsed, if any entry has a shape the
+// rewrite cannot guarantee to preserve (sparse files, or content on a
+// non-regular entry), or if the rewrite does not verify.
+func reserializeTar(in []byte) []byte {
+	items, err := readTarAll(in)
+	if err != nil {
+		return nil
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, it := range items {
+		switch it.hdr.Typeflag {
+		case tar.TypeGNUSparse:
+			return nil
+		}
+		if it.hdr.Size > 0 && it.hdr.Typeflag != tar.TypeReg && it.hdr.Typeflag != tar.TypeRegA {
+			return nil
+		}
+		if err := tw.WriteHeader(it.hdr); err != nil {
+			return nil
+		}
+		if _, err := tw.Write(it.content); err != nil {
+			return nil
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil
+	}
+	out := buf.Bytes()
+
+	outItems, err := readTarAll(out)
+	if err != nil {
+		return nil
+	}
+	want := lastByKey(items)
+	got := lastByKey(outItems)
+	if len(want) != len(got) {
+		return nil
+	}
+	for name, a := range want {
+		b, ok := got[name]
+		if !ok || keyOf(a.hdr) != keyOf(b.hdr) || !bytes.Equal(a.content, b.content) {
+			return nil
+		}
+	}
+	return out
 }
 
 // entrySpan is one tar entry's byte range in the decompressed stream (the
